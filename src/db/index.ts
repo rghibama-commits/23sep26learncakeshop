@@ -3,8 +3,9 @@ import { drizzle as drizzleNeon } from "drizzle-orm/neon-serverless";
 import { Pool as NeonPool } from "@neondatabase/serverless";
 import { drizzle as drizzlePg } from "drizzle-orm/node-postgres";
 import { Pool as PgPool } from "pg";
-import * as fs from "fs";
+import { INITIAL_MIGRATION_SQL } from "./initialMigrationSql";
 import * as path from "path";
+import * as fs from "fs";
 
 export type CakeCartDb = ReturnType<typeof drizzleNeon<typeof schema>> | ReturnType<typeof drizzlePg<typeof schema>> | any;
 
@@ -18,19 +19,21 @@ export async function getDb(): Promise<CakeCartDb> {
 
   const databaseUrl = process.env.DATABASE_URL;
 
-  // 1. Neon serverless / Remote Postgres (Railway, Neon, Supabase, etc.)
+  // 1. Neon serverless / Remote Postgres (Railway, Neon, etc.)
   if (databaseUrl && (databaseUrl.startsWith("postgres://") || databaseUrl.startsWith("postgresql://"))) {
+    let pool: PgPool | NeonPool;
+
     if (databaseUrl.includes("neon.tech")) {
-      const pool = new NeonPool({ connectionString: databaseUrl });
+      pool = new NeonPool({ connectionString: databaseUrl });
       globalDb = drizzleNeon(pool, { schema });
     } else {
-      const pool = new PgPool({ connectionString: databaseUrl });
-      globalDb = drizzlePg(pool, { schema });
-      
-      // Auto-migrate schema on remote Postgres if needed
-      await autoMigratePg(pool);
+      const pgPool = new PgPool({ connectionString: databaseUrl });
+      globalDb = drizzlePg(pgPool, { schema });
+      pool = pgPool;
     }
 
+    // Auto-migrate schema on remote Postgres if needed
+    await autoMigratePg(pool);
     initialized = true;
     return globalDb;
   }
@@ -57,72 +60,61 @@ export async function getDb(): Promise<CakeCartDb> {
 }
 
 // Function to auto-apply migrations on Postgres (Railway / Docker / Neon)
-async function autoMigratePg(pool: PgPool) {
+async function autoMigratePg(pool: any) {
   try {
-    const migrationPath = path.join(process.cwd(), "drizzle", "0000_sad_nekra.sql");
-    if (fs.existsSync(migrationPath)) {
-      const migrationSql = fs.readFileSync(migrationPath, "utf-8");
-      const statements = migrationSql
-        .split("--> statement-breakpoint")
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
+    const statements = INITIAL_MIGRATION_SQL
+      .split("--> statement-breakpoint")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
 
-      const client = await pool.connect();
-      try {
-        for (const statement of statements) {
-          try {
-            await client.query(statement);
-          } catch (err: any) {
-            // Ignore if already exists
-            if (!err.message?.includes("already exists") && !err.message?.includes("duplicate")) {
-              console.warn("Migration notice:", err.message);
-            }
+    const client = await pool.connect();
+    try {
+      for (const statement of statements) {
+        try {
+          await client.query(statement);
+        } catch (err: any) {
+          if (!err.message?.includes("already exists") && !err.message?.includes("duplicate")) {
+            console.warn("Migration notice:", err.message);
           }
         }
-
-        // Check if products exist, if not, auto-seed
-        const res = await client.query('SELECT count(*) FROM "products"');
-        const count = parseInt(res.rows[0]?.count || "0", 10);
-        if (count === 0) {
-          console.log("Database empty. Auto-seeding initial artisan cakes and slots...");
-          client.release();
-          const { runSeed } = await import("./seed");
-          await runSeed();
-          return;
-        }
-      } finally {
-        try {
-          client.release();
-        } catch {}
       }
+
+      // Check if products exist, if not, auto-seed
+      const res = await client.query('SELECT count(*) FROM "products"');
+      const count = parseInt(res.rows[0]?.count || "0", 10);
+      if (count === 0) {
+        console.log("Database empty. Auto-seeding initial artisan cakes and slots...");
+        const { runSeed } = await import("./seed");
+        await runSeed();
+      }
+    } finally {
+      try {
+        client.release();
+      } catch {}
     }
   } catch (error) {
-    console.error("Error checking/migrating Postgres database schema:", error);
+    console.error("Error auto-migrating remote Postgres database:", error);
   }
 }
 
-// Function to initialize local PGlite with schema from migration
+// Function to initialize local PGlite with schema
 async function initializeLocalDb(pglite: any) {
   try {
-    const migrationPath = path.join(process.cwd(), "drizzle", "0000_sad_nekra.sql");
-    if (fs.existsSync(migrationPath)) {
-      const migrationSql = fs.readFileSync(migrationPath, "utf-8");
-      const statements = migrationSql
-        .split("--> statement-breakpoint")
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
+    const statements = INITIAL_MIGRATION_SQL
+      .split("--> statement-breakpoint")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
 
-      for (const statement of statements) {
-        try {
-          await pglite.query(statement);
-        } catch (err: unknown) {
-          const errorMsg = err instanceof Error ? err.message : String(err);
-          if (
-            !errorMsg.includes("already exists") &&
-            !errorMsg.includes("duplicate")
-          ) {
-            console.warn("Migration notice:", errorMsg);
-          }
+    for (const statement of statements) {
+      try {
+        await pglite.query(statement);
+      } catch (err: unknown) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        if (
+          !errorMsg.includes("already exists") &&
+          !errorMsg.includes("duplicate")
+        ) {
+          console.warn("Migration notice:", errorMsg);
         }
       }
     }

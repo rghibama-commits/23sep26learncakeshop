@@ -11,52 +11,68 @@ export type CakeCartDb = ReturnType<typeof drizzleNeon<typeof schema>> | ReturnT
 
 let globalDb: CakeCartDb | null = null;
 let initialized = false;
+let initPromise: Promise<CakeCartDb> | null = null;
 
 export async function getDb(): Promise<CakeCartDb> {
   if (globalDb && initialized) {
     return globalDb;
   }
 
-  const databaseUrl = process.env.DATABASE_URL;
-
-  // 1. Neon serverless / Remote Postgres (Railway, Neon, etc.)
-  if (databaseUrl && (databaseUrl.startsWith("postgres://") || databaseUrl.startsWith("postgresql://"))) {
-    let pool: PgPool | NeonPool;
-
-    if (databaseUrl.includes("neon.tech")) {
-      pool = new NeonPool({ connectionString: databaseUrl });
-      globalDb = drizzleNeon(pool, { schema });
-    } else {
-      const pgPool = new PgPool({ connectionString: databaseUrl });
-      globalDb = drizzlePg(pgPool, { schema });
-      pool = pgPool;
-    }
-
-    // Auto-migrate schema on remote Postgres if needed
-    await autoMigratePg(pool);
-    initialized = true;
-    return globalDb;
+  if (initPromise) {
+    return initPromise;
   }
 
-  // 2. Embedded PostgreSQL (PGlite) for local development and offline testing
-  try {
-    const { PGlite } = await import("@electric-sql/pglite");
-    const { drizzle: drizzlePGlite } = await import("drizzle-orm/pglite");
+  initPromise = (async () => {
+    const databaseUrl = process.env.DATABASE_URL;
 
-    const localDbDir = path.join(process.cwd(), ".cakecart_db");
-    if (!fs.existsSync(localDbDir)) {
-      fs.mkdirSync(localDbDir, { recursive: true });
+    // 1. Neon serverless / Remote Postgres (Railway, Neon, etc.)
+    if (databaseUrl && (databaseUrl.startsWith("postgres://") || databaseUrl.startsWith("postgresql://"))) {
+      let pool: PgPool | NeonPool;
+
+      if (databaseUrl.includes("neon.tech")) {
+        pool = new NeonPool({ connectionString: databaseUrl });
+        globalDb = drizzleNeon(pool, { schema });
+      } else {
+        const pgPool = new PgPool({
+          connectionString: databaseUrl,
+          max: 10,
+          idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 5000,
+        });
+        globalDb = drizzlePg(pgPool, { schema });
+        pool = pgPool;
+      }
+
+      initialized = true;
+
+      // Auto-migrate schema on remote Postgres if needed
+      await autoMigratePg(pool);
+      return globalDb;
     }
 
-    const pgliteInstance = new PGlite(localDbDir);
-    globalDb = drizzlePGlite(pgliteInstance, { schema });
-    await initializeLocalDb(pgliteInstance);
-    initialized = true;
-    return globalDb;
-  } catch (err) {
-    console.error("PGlite initialization error:", err);
-    throw err;
-  }
+    // 2. Embedded PostgreSQL (PGlite) for local development and offline testing
+    try {
+      const { PGlite } = await import("@electric-sql/pglite");
+      const { drizzle: drizzlePGlite } = await import("drizzle-orm/pglite");
+
+      const localDbDir = path.join(process.cwd(), ".cakecart_db");
+      if (!fs.existsSync(localDbDir)) {
+        fs.mkdirSync(localDbDir, { recursive: true });
+      }
+
+      const pgliteInstance = new PGlite(localDbDir);
+      globalDb = drizzlePGlite(pgliteInstance, { schema });
+      initialized = true;
+      await initializeLocalDb(pgliteInstance);
+      return globalDb;
+    } catch (err) {
+      console.error("PGlite initialization error:", err);
+      initPromise = null;
+      throw err;
+    }
+  })();
+
+  return initPromise;
 }
 
 // Function to auto-apply migrations on Postgres (Railway / Docker / Neon)
